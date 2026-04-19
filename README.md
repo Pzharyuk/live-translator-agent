@@ -64,7 +64,7 @@ If your Mac is on the same network as the Kubernetes cluster you can point `serv
 
 ```json
 {
-  "serverUrl": "http://10.43.x.x:3000",
+  "serverUrl": "http://192.168.1.100:3000",
   "label": "My Mac"
 }
 ```
