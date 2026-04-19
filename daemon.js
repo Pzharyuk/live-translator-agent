@@ -6,6 +6,18 @@ const recorder = require('node-record-lpcm16');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const crypto = require('crypto');
+
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+
+const STATE_PATH = path.join(
+  os.homedir(),
+  '.config',
+  'live-translator-agent',
+  'state.json',
+);
 
 // ---------------------------------------------------------------------------
 // Config
@@ -32,6 +44,24 @@ if (!serverUrl) {
   console.error('[Agent] Config is missing "serverUrl". Edit ' + CONFIG_PATH);
   process.exit(1);
 }
+
+function loadOrCreateAgentId() {
+  try {
+    const state = JSON.parse(fs.readFileSync(STATE_PATH, 'utf8'));
+    if (typeof state.agentId === 'string' && state.agentId.length > 0) {
+      return state.agentId;
+    }
+  } catch {
+    // state.json missing or malformed — generate a fresh id below
+  }
+  const agentId = crypto.randomUUID();
+  fs.mkdirSync(path.dirname(STATE_PATH), { recursive: true });
+  fs.writeFileSync(STATE_PATH, JSON.stringify({ agentId }, null, 2) + '\n');
+  console.log(`[Agent] Generated new agentId ${agentId} (stored in ${STATE_PATH})`);
+  return agentId;
+}
+
+const agentId = loadOrCreateAgentId();
 
 const DEVICE_ID = 'mac-daemon-mic';
 // 4096 int16 samples × 2 bytes = 8192 bytes ≈ 250 ms at 16 kHz — matches browser chunk size
