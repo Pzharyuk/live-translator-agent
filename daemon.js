@@ -7,6 +7,8 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
+const { execFileSync } = require('child_process');
+const { parseAudioDevices } = require('./scripts/parse-audio-devices');
 
 // ---------------------------------------------------------------------------
 // State
@@ -62,6 +64,24 @@ function loadOrCreateAgentId() {
 }
 
 const agentId = loadOrCreateAgentId();
+
+function enumerateDevices() {
+  try {
+    const raw = execFileSync('system_profiler', ['SPAudioDataType', '-json'], {
+      encoding: 'utf8',
+      timeout: 5000,
+    });
+    const devices = parseAudioDevices(raw);
+    console.log(`[Agent] Enumerated ${devices.length} input device(s)`);
+    return devices;
+  } catch (err) {
+    console.error(`[Agent] Device enumeration failed: ${err.message}`);
+    return [];
+  }
+}
+
+let devices = enumerateDevices();
+let selectedDevice = null;
 
 const DEVICE_ID = 'mac-daemon-mic';
 // 4096 int16 samples × 2 bytes = 8192 bytes ≈ 250 ms at 16 kHz — matches browser chunk size
