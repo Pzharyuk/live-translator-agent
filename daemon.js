@@ -110,8 +110,14 @@ const socket = io(serverUrl, {
 
 socket.on('connect', () => {
   console.log(`[Agent] Connected (${socket.id})`);
-  socket.emit('register_audio_source', { label, deviceId: DEVICE_ID });
-  console.log(`[Agent] Registered as audio source: "${label}"`);
+  socket.emit('register_audio_source', {
+    agentId,
+    label,
+    deviceId: DEVICE_ID,
+    devices,
+    selectedDevice,
+  });
+  console.log(`[Agent] Registered as audio source: "${label}" (${devices.length} device(s), selected=${selectedDevice ?? 'none'})`);
 });
 
 socket.on('disconnect', (reason) => {
