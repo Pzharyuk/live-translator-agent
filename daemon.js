@@ -82,6 +82,7 @@ function enumerateDevices() {
 
 let devices = enumerateDevices();
 let selectedDevice = null;
+let refreshInFlight = false;
 
 const DEVICE_ID = 'mac-daemon-mic';
 // 4096 int16 samples × 2 bytes = 8192 bytes ≈ 250 ms at 16 kHz — matches browser chunk size
@@ -145,6 +146,50 @@ socket.on('broadcast_status', (data) => {
   }
 });
 
+socket.on('select_device', (data) => {
+  // Socket.io dispatches events sequentially — stopStreaming()/startStreaming()
+  // below cannot be reentered by another select_device or refresh_devices.
+  const id = data?.id;
+  if (!id) return;
+  if (!devices.some((d) => d.id === id)) {
+    socket.emit('audio_stream_error', { deviceId: id, message: 'device not available on this agent' });
+    return;
+  }
+  if (id === selectedDevice) return;
+
+  console.log(`[Agent] Switching selected device ${selectedDevice ?? 'none'} → ${id}`);
+  const wasStreaming = isStreaming;
+  if (wasStreaming) stopStreaming();
+  selectedDevice = id;
+  if (wasStreaming) startStreaming();
+});
+
+socket.on('refresh_devices', () => {
+  if (refreshInFlight) {
+    console.log('[Agent] refresh_devices already in flight — ignoring');
+    return;
+  }
+  refreshInFlight = true;
+  try {
+    console.log('[Agent] Re-enumerating devices on admin request');
+    devices = enumerateDevices();
+    if (selectedDevice && !devices.some((d) => d.id === selectedDevice)) {
+      console.log(`[Agent] Previously selected device ${selectedDevice} is gone — clearing selection`);
+      selectedDevice = null;
+      if (isStreaming) stopStreaming();
+    }
+    socket.emit('register_audio_source', {
+      agentId,
+      label,
+      deviceId: DEVICE_ID,
+      devices,
+      selectedDevice,
+    });
+  } finally {
+    refreshInFlight = false;
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Audio capture
 // ---------------------------------------------------------------------------
@@ -154,21 +199,31 @@ function startStreaming() {
   isStreaming = true;
   audioBuffer = Buffer.alloc(0);
 
+  const deviceName = devices.find((d) => d.id === selectedDevice)?.name;
+  const recordOpts = {
+    sampleRate: 16000,
+    channels: 1,
+    audioType: 'raw',
+    encoding: 'signed-integer',
+    bits: 16,
+  };
+  if (deviceName) {
+    // node-record-lpcm16's sox recorder exports `device` via the AUDIODEV env var;
+    // sox's coreaudio driver (macOS default) selects the device by its macOS
+    // display name — which is what system_profiler reports. If coreaudio is
+    // not the compiled-in default driver, this silently falls back to the
+    // default input and we'd need a child_process.spawn('sox','-t','coreaudio',…)
+    // path instead.
+    recordOpts.device = deviceName;
+  }
+
   try {
-    recording = recorder.record({
-      sampleRate: 16000,
-      channels: 1,
-      audioType: 'raw',
-      encoding: 'signed-integer',
-      bits: 16,
-    });
+    recording = recorder.record(recordOpts);
 
     recording
       .stream()
       .on('data', (chunk) => {
         audioBuffer = Buffer.concat([audioBuffer, chunk]);
-
-        // Emit fixed-size chunks matching the browser's ScriptProcessorNode output
         while (audioBuffer.length >= CHUNK_SIZE) {
           const slice = audioBuffer.subarray(0, CHUNK_SIZE);
           audioBuffer = audioBuffer.subarray(CHUNK_SIZE);
@@ -177,12 +232,20 @@ function startStreaming() {
       })
       .on('error', (err) => {
         console.error('[Agent] Audio stream error:', err.message);
+        socket.emit('audio_stream_error', {
+          deviceId: selectedDevice ?? '',
+          message: err.message,
+        });
         stopStreaming();
       });
 
-    console.log('[Agent] Mic capture running (16 kHz, 16-bit mono PCM)');
+    console.log(`[Agent] Mic capture running (16 kHz, 16-bit mono PCM) on ${deviceName ?? 'default device'}`);
   } catch (err) {
     console.error('[Agent] Failed to start recording:', err.message);
+    socket.emit('audio_stream_error', {
+      deviceId: selectedDevice ?? '',
+      message: err.message,
+    });
     isStreaming = false;
     recording = null;
   }
