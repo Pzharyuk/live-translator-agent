@@ -7,7 +7,7 @@
     "start": "node daemon.js"
   },
   "dependencies": {
-    "node-record-lpcm16": "^2.0.0",
+    "node-record-lpcm16": "^1.0.1",
     "socket.io-client": "^4.8.1"
   },
   "engines": {
