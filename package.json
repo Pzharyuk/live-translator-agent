@@ -1,0 +1,16 @@
+{
+  "name": "live-translator-agent",
+  "version": "1.0.0",
+  "description": "macOS mic audio daemon for live-translator-node — streams mic audio to the backend via Socket.io",
+  "main": "daemon.js",
+  "scripts": {
+    "start": "node daemon.js"
+  },
+  "dependencies": {
+    "node-record-lpcm16": "^2.0.0",
+    "socket.io-client": "^4.8.1"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

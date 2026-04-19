@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.live-translator.agent</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__NODE_PATH__</string>
+        <string>__DAEMON_PATH__</string>
+    </array>
+
+    <!-- Start immediately when loaded and restart if it crashes -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>__LOG_DIR__/live-translator-agent.log</string>
+    <key>StandardErrorPath</key>
+    <string>__LOG_DIR__/live-translator-agent.error.log</string>
+
+    <!-- Include Homebrew paths so sox is found at runtime -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>HOME</key>
+        <string>__HOME__</string>
+    </dict>
+</dict>
+</plist>
