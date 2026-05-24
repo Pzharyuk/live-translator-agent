@@ -7,8 +7,56 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
-const { execFileSync } = require('child_process');
+const { execFileSync, spawnSync } = require('child_process');
 const { parseAudioDevices } = require('./scripts/parse-audio-devices');
+
+// ---------------------------------------------------------------------------
+// CLI subcommands — these short-circuit the daemon and exit
+// ---------------------------------------------------------------------------
+
+const SOX_BIN = '/opt/homebrew/bin/sox';
+
+/**
+ * macOS-specific helper. Opens System Settings → Privacy & Security →
+ * Microphone and prints exact steps to grant the sox binary permission.
+ * Then runs sox once interactively so macOS files Terminal's grant in
+ * TCC (helps if the user adds sox manually but Terminal isn't already
+ * authorised either).
+ *
+ * Background: launchd-spawned processes don't get the standard mic
+ * permission prompt — macOS silently kills sox the moment it tries to
+ * open coreaudio. The fix is a manual entry in Privacy & Security for
+ * the sox binary itself, which this helper makes discoverable.
+ */
+function grantMicCommand() {
+  if (process.platform !== 'darwin') {
+    console.log('This helper is macOS-only. On Linux/Windows mic permissions are managed differently.');
+    process.exit(0);
+  }
+  console.log('=== live-translator-agent: macOS mic permission helper ===');
+  console.log();
+  console.log('Opening System Settings → Privacy & Security → Microphone...');
+  spawnSync('open', ['x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone']);
+  console.log();
+  console.log('In that panel:');
+  console.log('  1. Click the "+" button below the list (unlock with TouchID/password if needed)');
+  console.log('  2. Press  Cmd+Shift+G  in the file picker');
+  console.log(`  3. Paste:  ${SOX_BIN}`);
+  console.log('  4. Click Open, then toggle the new "sox" entry ON');
+  console.log();
+  console.log('Then restart the agent:');
+  console.log('  brew services restart live-translator-agent');
+  console.log();
+  console.log('Why this is needed: launchd-spawned processes don\'t trigger the standard');
+  console.log('macOS mic permission prompt. Terminal-context sox works (Terminal has its own');
+  console.log('grant), but the brew service runs under launchd which silently kills sox until');
+  console.log('the sox binary itself is in the Microphone list.');
+  process.exit(0);
+}
+
+if (process.argv[2] === '--grant-mic' || process.argv[2] === '--mic-permission') {
+  grantMicCommand();
+}
 
 // ---------------------------------------------------------------------------
 // State
@@ -194,10 +242,38 @@ socket.on('refresh_devices', () => {
 // Audio capture
 // ---------------------------------------------------------------------------
 
+/**
+ * Translate an empty/cryptic stream error into a clear actionable
+ * message. The classic macOS-TCC-denial pattern is: sox exits within
+ * ~500 ms of spawn, with an empty or undefined error message and zero
+ * audio bytes received. macOS killed it silently because the launchd
+ * context lacks Microphone permission for the sox binary.
+ */
+function diagnoseStreamError(err, msSinceStart, bytesReceived) {
+  const rawMsg = err?.message ?? '';
+  const looksLikeTccDenial =
+    process.platform === 'darwin' &&
+    bytesReceived === 0 &&
+    msSinceStart < 800 &&
+    (!rawMsg || rawMsg.trim() === '' || /exited|killed|signal/i.test(rawMsg));
+  if (looksLikeTccDenial) {
+    return [
+      'macOS Microphone permission denied for sox.',
+      'sox was killed by macOS TCC before producing any audio — launchd-spawned',
+      `processes need an explicit entry for ${SOX_BIN} in`,
+      'System Settings → Privacy & Security → Microphone.',
+      'Run "live-translator-agent --grant-mic" on the Mac for step-by-step instructions.',
+    ].join(' ');
+  }
+  return rawMsg || 'Unknown audio stream error (sox died with no message)';
+}
+
 function startStreaming() {
   if (isStreaming) return;
   isStreaming = true;
   audioBuffer = Buffer.alloc(0);
+  let bytesReceived = 0;
+  const startedAt = Date.now();
 
   const deviceName = devices.find((d) => d.id === selectedDevice)?.name;
   const recordOpts = {
@@ -223,6 +299,7 @@ function startStreaming() {
     recording
       .stream()
       .on('data', (chunk) => {
+        bytesReceived += chunk.length;
         audioBuffer = Buffer.concat([audioBuffer, chunk]);
         while (audioBuffer.length >= CHUNK_SIZE) {
           const slice = audioBuffer.subarray(0, CHUNK_SIZE);
@@ -231,20 +308,24 @@ function startStreaming() {
         }
       })
       .on('error', (err) => {
-        console.error('[Agent] Audio stream error:', err.message);
+        const msSinceStart = Date.now() - startedAt;
+        const message = diagnoseStreamError(err, msSinceStart, bytesReceived);
+        console.error(`[Agent] Audio stream error: ${message} (raw="${err?.message ?? ''}", bytes=${bytesReceived}, ms=${msSinceStart})`);
         socket.emit('audio_stream_error', {
           deviceId: selectedDevice ?? '',
-          message: err.message,
+          message,
         });
         stopStreaming();
       });
 
     console.log(`[Agent] Mic capture running (16 kHz, 16-bit mono PCM) on ${deviceName ?? 'default device'}`);
   } catch (err) {
-    console.error('[Agent] Failed to start recording:', err.message);
+    const msSinceStart = Date.now() - startedAt;
+    const message = diagnoseStreamError(err, msSinceStart, 0);
+    console.error(`[Agent] Failed to start recording: ${message}`);
     socket.emit('audio_stream_error', {
       deviceId: selectedDevice ?? '',
-      message: err.message,
+      message,
     });
     isStreaming = false;
     recording = null;

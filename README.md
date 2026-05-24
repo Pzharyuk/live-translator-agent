@@ -30,6 +30,32 @@ brew services start live-translator-agent
 
 The agent starts automatically on login and restarts if it crashes.
 
+### ⚠️ macOS Microphone permission (required, one-time)
+
+Because the agent runs under `launchd`, macOS will silently kill `sox`
+the first time it tries to open the microphone unless the sox binary
+itself is added to the Microphone privacy list. The symptom is
+`Audio stream error: macOS Microphone permission denied for sox` in
+the log when a broadcast starts.
+
+Run the bundled helper to get walked through the fix:
+
+```sh
+live-translator-agent --grant-mic
+```
+
+This opens **System Settings → Privacy & Security → Microphone** and
+prints exact steps:
+
+1. Click the `+` button below the list (unlock if prompted)
+2. Press `Cmd+Shift+G` in the file picker
+3. Paste `/opt/homebrew/bin/sox` → Open
+4. Toggle the new **sox** entry ON
+5. `brew services restart live-translator-agent`
+
+You only need to do this once per Mac. Granting Mic permission to
+Terminal does **not** cascade to launchd-spawned processes.
+
 ## Manual install
 
 **Requirements:** Node.js ≥ 18, [sox](https://sox.sourceforge.net/)
