@@ -61,12 +61,17 @@ if [ ! -f "$CONFIG_FILE" ]; then
   read -rp "  Device label [Mac Daemon]: " LABEL
   LABEL="${LABEL:-Mac Daemon}"
 
+  read -rsp "  Agent pre-shared key (from server admin; leave blank if not enforced): " AGENT_PSK
+  echo ""
+
   cat > "$CONFIG_FILE" <<EOF
 {
   "serverUrl": "$SERVER_URL",
-  "label": "$LABEL"
+  "label": "$LABEL",
+  "agentPsk": "$AGENT_PSK"
 }
 EOF
+  chmod 600 "$CONFIG_FILE"
   log "Config saved to $CONFIG_FILE"
 else
   warn "Config already exists — skipping. Edit $CONFIG_FILE to change settings."

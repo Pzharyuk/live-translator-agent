@@ -95,6 +95,14 @@ if (!serverUrl) {
   process.exit(1);
 }
 
+// Pre-shared key — required by servers that enforce agent auth. Falls back
+// to the AGENT_PSK env var so the launchd plist or shell can override the
+// on-disk value without rewriting config.json.
+const agentPsk = (process.env.AGENT_PSK || config.agentPsk || '').trim();
+if (!agentPsk) {
+  console.warn('[Agent] No agentPsk in config and AGENT_PSK env unset — server may reject the registration.');
+}
+
 function loadOrCreateAgentId() {
   try {
     const state = JSON.parse(fs.readFileSync(STATE_PATH, 'utf8'));
@@ -155,6 +163,12 @@ const socket = io(serverUrl, {
   reconnection: true,
   reconnectionDelay: 2000,
   reconnectionDelayMax: 10000,
+  auth: { agentPsk },
+});
+
+socket.on('agent_auth_error', (err) => {
+  console.error(`[Agent] Server rejected registration: ${err?.message || 'invalid PSK'}`);
+  console.error(`[Agent] Fix the agentPsk in ${CONFIG_PATH} (or AGENT_PSK env var) and restart.`);
 });
 
 socket.on('connect', () => {
