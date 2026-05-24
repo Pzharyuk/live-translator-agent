@@ -7,7 +7,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
-const { execFileSync, spawnSync } = require('child_process');
+const { execFileSync, spawnSync, spawn } = require('child_process');
 const { parseAudioDevices } = require('./scripts/parse-audio-devices');
 
 // ---------------------------------------------------------------------------
@@ -244,13 +244,30 @@ socket.on('refresh_devices', () => {
 
 /**
  * Translate an empty/cryptic stream error into a clear actionable
- * message. The classic macOS-TCC-denial pattern is: sox exits within
- * ~500 ms of spawn, with an empty or undefined error message and zero
- * audio bytes received. macOS killed it silently because the launchd
- * context lacks Microphone permission for the sox binary.
+ * message. Two known sox failure modes look identical at the JS layer
+ * (fast exit, no stderr, zero bytes): (a) macOS TCC mic-permission
+ * denial, (b) sox's stderr leaking the "no default audio device"
+ * message that means the device-name path is broken. We distinguish
+ * by inspecting the captured stderr string when we have one.
  */
-function diagnoseStreamError(err, msSinceStart, bytesReceived) {
+function diagnoseStreamError(err, msSinceStart, bytesReceived, stderrBuf) {
   const rawMsg = err?.message ?? '';
+  const stderr = (stderrBuf ?? '').toString();
+  // sox's "no default audio device configured" fires when we set
+  // AUDIODEV to a named device on macOS (node-record-lpcm16's path).
+  if (/no default audio device/i.test(stderr)) {
+    return 'sox could not open the selected device by name. The agent will fall back to direct coreaudio spawn on next start.';
+  }
+  // sox's "Permission denied" stderr is the cleanest TCC signal.
+  if (/permission denied|operation not permitted/i.test(stderr)) {
+    return [
+      'macOS Microphone permission denied for sox.',
+      `Add ${SOX_BIN} to System Settings → Privacy & Security → Microphone.`,
+      'Run "live-translator-agent --grant-mic" for step-by-step instructions.',
+    ].join(' ');
+  }
+  // Fall back to the heuristic: fast empty-stderr exit on macOS most
+  // often means TCC (the silent-kill pattern).
   const looksLikeTccDenial =
     process.platform === 'darwin' &&
     bytesReceived === 0 &&
@@ -258,14 +275,44 @@ function diagnoseStreamError(err, msSinceStart, bytesReceived) {
     (!rawMsg || rawMsg.trim() === '' || /exited|killed|signal/i.test(rawMsg));
   if (looksLikeTccDenial) {
     return [
-      'macOS Microphone permission denied for sox.',
-      'sox was killed by macOS TCC before producing any audio — launchd-spawned',
-      `processes need an explicit entry for ${SOX_BIN} in`,
-      'System Settings → Privacy & Security → Microphone.',
-      'Run "live-translator-agent --grant-mic" on the Mac for step-by-step instructions.',
+      'sox died fast with no output. Most likely macOS Microphone permission denial for the launchd-spawned process.',
+      `Add ${SOX_BIN} to System Settings → Privacy & Security → Microphone (run "live-translator-agent --grant-mic" for steps).`,
+      'If permission is already granted, the device may not be physically producing audio — check cable/gain on the audio interface.',
     ].join(' ');
   }
-  return rawMsg || 'Unknown audio stream error (sox died with no message)';
+  return rawMsg || stderr.trim() || 'Unknown audio stream error (sox died with no message)';
+}
+
+/**
+ * macOS-specific direct sox capture. Skips node-record-lpcm16 because
+ * its AUDIODEV-env-var device selection is treated by sox as an output
+ * type name (not a coreaudio device name), causing "no default audio
+ * device configured" errors when a named device is selected.
+ *
+ * Spawns sox directly with `-t coreaudio "Device Name"` which is the
+ * documented way to pick a specific coreaudio input device. Streams
+ * 16 kHz / 16-bit / mono signed PCM on stdout.
+ *
+ * Returns an object with the same shape as node-record-lpcm16's
+ * recorder so the caller's stream() interface works unchanged.
+ */
+function startSoxCoreaudio(deviceName) {
+  const args = [
+    '-t', 'coreaudio', deviceName,
+    '-r', '16000',
+    '-c', '1',
+    '-b', '16',
+    '-e', 'signed-integer',
+    '-t', 'raw',
+    '-', // stdout
+  ];
+  const child = spawn(SOX_BIN, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+  return {
+    process: child,
+    stream: () => child.stdout,
+    stderr: child.stderr,
+    stop: () => { try { child.kill('SIGTERM'); } catch { /* already gone */ } },
+  };
 }
 
 function startStreaming() {
@@ -274,55 +321,72 @@ function startStreaming() {
   audioBuffer = Buffer.alloc(0);
   let bytesReceived = 0;
   const startedAt = Date.now();
+  let stderrBuf = '';
 
   const deviceName = devices.find((d) => d.id === selectedDevice)?.name;
-  const recordOpts = {
-    sampleRate: 16000,
-    channels: 1,
-    audioType: 'raw',
-    encoding: 'signed-integer',
-    bits: 16,
-  };
-  if (deviceName) {
-    // node-record-lpcm16's sox recorder exports `device` via the AUDIODEV env var;
-    // sox's coreaudio driver (macOS default) selects the device by its macOS
-    // display name — which is what system_profiler reports. If coreaudio is
-    // not the compiled-in default driver, this silently falls back to the
-    // default input and we'd need a child_process.spawn('sox','-t','coreaudio',…)
-    // path instead.
-    recordOpts.device = deviceName;
-  }
+
+  // macOS-specific: when a named device is selected, spawn sox directly
+  // with `-t coreaudio "Name"` because node-record-lpcm16's AUDIODEV
+  // approach doesn't translate to coreaudio device names. Default
+  // device + Linux all stay on the library's normal path.
+  const useDirectSox = process.platform === 'darwin' && deviceName;
 
   try {
-    recording = recorder.record(recordOpts);
-
-    recording
-      .stream()
-      .on('data', (chunk) => {
-        bytesReceived += chunk.length;
-        audioBuffer = Buffer.concat([audioBuffer, chunk]);
-        while (audioBuffer.length >= CHUNK_SIZE) {
-          const slice = audioBuffer.subarray(0, CHUNK_SIZE);
-          audioBuffer = audioBuffer.subarray(CHUNK_SIZE);
-          socket.emit('audio_chunk', { audio: slice.toString('base64') });
-        }
-      })
-      .on('error', (err) => {
+    if (useDirectSox) {
+      recording = startSoxCoreaudio(deviceName);
+      recording.stderr.on('data', (chunk) => { stderrBuf += chunk.toString(); });
+      recording.stream()
+        .on('data', (chunk) => {
+          bytesReceived += chunk.length;
+          audioBuffer = Buffer.concat([audioBuffer, chunk]);
+          while (audioBuffer.length >= CHUNK_SIZE) {
+            const slice = audioBuffer.subarray(0, CHUNK_SIZE);
+            audioBuffer = audioBuffer.subarray(CHUNK_SIZE);
+            socket.emit('audio_chunk', { audio: slice.toString('base64') });
+          }
+        })
+        .on('error', (err) => emitStreamError(err));
+      recording.process.on('exit', (code, signal) => {
+        if (!isStreaming) return; // intentional stop
+        // sox exiting on its own = error path
         const msSinceStart = Date.now() - startedAt;
-        const message = diagnoseStreamError(err, msSinceStart, bytesReceived);
-        console.error(`[Agent] Audio stream error: ${message} (raw="${err?.message ?? ''}", bytes=${bytesReceived}, ms=${msSinceStart})`);
-        socket.emit('audio_stream_error', {
-          deviceId: selectedDevice ?? '',
-          message,
-        });
-        stopStreaming();
+        const synthMsg = stderrBuf || `sox exited (code=${code} signal=${signal})`;
+        emitStreamError({ message: synthMsg });
       });
-
-    console.log(`[Agent] Mic capture running (16 kHz, 16-bit mono PCM) on ${deviceName ?? 'default device'}`);
+      console.log(`[Agent] Mic capture running (16 kHz, 16-bit mono PCM) on ${deviceName} [direct coreaudio]`);
+    } else {
+      const recordOpts = {
+        sampleRate: 16000,
+        channels: 1,
+        audioType: 'raw',
+        encoding: 'signed-integer',
+        bits: 16,
+      };
+      recording = recorder.record(recordOpts);
+      recording
+        .stream()
+        .on('data', (chunk) => {
+          bytesReceived += chunk.length;
+          audioBuffer = Buffer.concat([audioBuffer, chunk]);
+          while (audioBuffer.length >= CHUNK_SIZE) {
+            const slice = audioBuffer.subarray(0, CHUNK_SIZE);
+            audioBuffer = audioBuffer.subarray(CHUNK_SIZE);
+            socket.emit('audio_chunk', { audio: slice.toString('base64') });
+          }
+        })
+        .on('error', (err) => emitStreamError(err));
+      console.log(`[Agent] Mic capture running (16 kHz, 16-bit mono PCM) on default device`);
+    }
   } catch (err) {
+    emitStreamError(err);
+    return;
+  }
+
+  function emitStreamError(err) {
+    if (!isStreaming) return; // already torn down
     const msSinceStart = Date.now() - startedAt;
-    const message = diagnoseStreamError(err, msSinceStart, 0);
-    console.error(`[Agent] Failed to start recording: ${message}`);
+    const message = diagnoseStreamError(err, msSinceStart, bytesReceived, stderrBuf);
+    console.error(`[Agent] Audio stream error: ${message} (raw="${err?.message ?? ''}", stderr="${stderrBuf.slice(0, 200).trim()}", bytes=${bytesReceived}, ms=${msSinceStart})`);
     socket.emit('audio_stream_error', {
       deviceId: selectedDevice ?? '',
       message,
