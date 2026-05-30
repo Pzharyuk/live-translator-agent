@@ -95,6 +95,17 @@ if (!serverUrl) {
   process.exit(1);
 }
 
+// Optional input-channel selector for multi-channel coreaudio devices.
+// PreSonus interfaces (e.g. AudioBox 1818 VSL) expose 18 channels and
+// sox's default downmix averages them — so a mic on ch 1 gets divided
+// by ~18 and reaches the server as silence. Setting `channel: 1` (or
+// any 1-based index) appends `remix N` to the sox command so only that
+// channel feeds the mono output. Unset / 0 = preserve default downmix
+// (matters for stereo devices that should keep summing L+R).
+const inputChannel = Number.isInteger(config.channel) && config.channel > 0
+  ? config.channel
+  : 0;
+
 // Pre-shared key — required by servers that enforce agent auth. Falls back
 // to the AGENT_PSK env var so the launchd plist or shell can override the
 // on-disk value without rewriting config.json.
@@ -320,6 +331,13 @@ function startSoxCoreaudio(deviceName) {
     '-t', 'raw',
     '-', // stdout
   ];
+  // `remix N` is a sox EFFECT, so it goes after the output spec. Picks a
+  // single input channel for the mono downmix instead of averaging all
+  // device channels (which silences mic signal on multi-channel
+  // interfaces like the AudioBox 1818 VSL).
+  if (inputChannel > 0) {
+    args.push('remix', String(inputChannel));
+  }
   const child = spawn(SOX_BIN, args, { stdio: ['ignore', 'pipe', 'pipe'] });
   return {
     process: child,
@@ -367,7 +385,7 @@ function startStreaming() {
         const synthMsg = stderrBuf || `sox exited (code=${code} signal=${signal})`;
         emitStreamError({ message: synthMsg });
       });
-      console.log(`[Agent] Mic capture running (16 kHz, 16-bit mono PCM) on ${deviceName} [direct coreaudio]`);
+      console.log(`[Agent] Mic capture running (16 kHz, 16-bit mono PCM) on ${deviceName} [direct coreaudio${inputChannel > 0 ? `, remix ch ${inputChannel}` : ''}]`);
     } else {
       const recordOpts = {
         sampleRate: 16000,

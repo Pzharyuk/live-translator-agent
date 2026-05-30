@@ -128,6 +128,7 @@ launchctl list | grep live-translator      # raw launchctl
 | `label` | `"Mac Daemon"` | Display name shown in the translator UI |
 | `device` | _(system default)_ | Audio input device name (see `sox -d --list-devtypes`) |
 | `agentPsk` | `""` | Pre-shared key the server requires from agents. Get this from your server admin (`auth.agent_psk` in `application.yaml` / `AGENT_PSK` env). The `AGENT_PSK` env var overrides this field if both are set. |
+| `channel` | _(unset)_ | 1-based input channel for multi-channel coreaudio devices. When set, sox uses `remix N` to feed only that channel into the mono downmix. Required for multi-channel interfaces (PreSonus AudioBox, MOTU, RME, etc.) where the default 18-channel downmix would silence a mic on a single channel. Leave unset for laptops/USB mics where the default downmix is correct. |
 
 ## Pre-shared key (agent auth)
 
@@ -177,6 +178,31 @@ launchctl load   ~/Library/LaunchAgents/com.live-translator.agent.plist
 
 If you rotate the server-side key but forget to update agents, you'll see `agent_auth_error: invalid_psk` in the agent log and the daemon will sit idle until the keys match again.
 
+## Multi-channel audio interfaces
+
+USB/Thunderbolt interfaces like the PreSonus AudioBox 1818 VSL, MOTU UltraLite, or RME Babyface expose 8–18 input channels at once. Sox opens the device at its native channel count and then downmixes to mono — averaging *all* channels. If your mic is plugged into channel 1 of an 18-channel device, the signal is divided by 18 and arrives as effective silence (sox shows `In:0.00%` while still producing PCM bytes).
+
+The fix is to set the `channel` config option so sox picks just one input channel for the downmix:
+
+```json
+{
+  "serverUrl": "https://translate.onit.systems",
+  "label": "Console Mac",
+  "agentPsk": "...",
+  "channel": 1
+}
+```
+
+The agent appends `remix 1` (1-based) to its sox command when this is set, which makes the device act effectively single-channel. The startup log line shows `[direct coreaudio, remix ch 1]` to confirm it's active.
+
+To find which channel your mic is on, run sox manually and check per-channel RMS:
+
+```sh
+sox -t coreaudio "AudioBox 1818 VSL" -n stats trim 0 5
+```
+
+The channel with a real RMS (not `-inf dB`) is the one to put in `channel`.
+
 ## Troubleshooting
 
 | Symptom | Likely cause |
@@ -184,7 +210,8 @@ If you rotate the server-side key but forget to update agents, you'll see `agent
 | `Server rejected registration: ...invalid PSK` in agent log | `agentPsk` (or `AGENT_PSK` env) does not match the server's `auth.agent_psk`. Fix and restart the daemon. |
 | `No agentPsk in config and AGENT_PSK env unset` warning at startup | Config has no key and env is empty. Works only if the server's PSK is also empty (enforcement off). |
 | Agent connects but never streams; server logs show no registration | Connection succeeded but `register_audio_source` was rejected. Look for `register_audio_source REJECTED` in the server log. |
-| `macOS Microphone permission denied for sox` on broadcast start | Add `/opt/homebrew/bin/sox` to System Settings → Privacy & Security → Microphone (see `--grant-mic` helper above). |
+| `macOS Microphone permission denied for sox` on broadcast start | Add `/opt/homebrew/bin/sox` to System Settings → Privacy & Security → Microphone (see `--grant-mic` helper above). The `[direct coreaudio]` capture path usually bypasses this; the `node-record-lpcm16` path (default device on macOS) still needs the grant. |
+| Server shows the agent registered + streaming, but viewers hear silence on a multi-channel interface | Set `channel: N` in `config.json` to pick the actual mic channel (see _Multi-channel audio interfaces_ above). |
 
 ## Dependencies
 
