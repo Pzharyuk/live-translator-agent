@@ -128,7 +128,7 @@ launchctl list | grep live-translator      # raw launchctl
 | `label` | `"Mac Daemon"` | Display name shown in the translator UI |
 | `device` | _(system default)_ | Audio input device name (see `sox -d --list-devtypes`) |
 | `agentPsk` | `""` | Pre-shared key the server requires from agents. Get this from your server admin (`auth.agent_psk` in `application.yaml` / `AGENT_PSK` env). The `AGENT_PSK` env var overrides this field if both are set. |
-| `channel` | _(unset)_ | 1-based input channel for multi-channel coreaudio devices. When set, sox uses `remix N` to feed only that channel into the mono downmix. Required for multi-channel interfaces (PreSonus AudioBox, MOTU, RME, etc.) where the default 18-channel downmix would silence a mic on a single channel. Leave unset for laptops/USB mics where the default downmix is correct. |
+| `channel` | _(unset)_ | Which input channels of a multi-channel coreaudio device should feed the mono output. Accepts a number (`1`), a sox range string (`"1-8"`), a comma list (`"1,3,5"`), or an array (`[1,3,5]`). Sox `remix` *sums* the selected channels (no 1/N attenuation), so silent channels contribute zero and any active channel passes through at full amplitude. Required for multi-channel interfaces (PreSonus AudioBox, MOTU, RME) where the default downmix would silence a mic. Leave unset for laptops / USB mics. |
 
 ## Pre-shared key (agent auth)
 
@@ -182,18 +182,23 @@ If you rotate the server-side key but forget to update agents, you'll see `agent
 
 USB/Thunderbolt interfaces like the PreSonus AudioBox 1818 VSL, MOTU UltraLite, or RME Babyface expose 8–18 input channels at once. Sox opens the device at its native channel count and then downmixes to mono — averaging *all* channels. If your mic is plugged into channel 1 of an 18-channel device, the signal is divided by 18 and arrives as effective silence (sox shows `In:0.00%` while still producing PCM bytes).
 
-The fix is to set the `channel` config option so sox picks just one input channel for the downmix:
+The fix is to set the `channel` config option so sox uses `remix` to select which input channels feed the mono output. **`remix` sums** the selected channels (it does *not* average them), so silent channels contribute 0 and any active channel passes through at full amplitude.
 
 ```json
 {
   "serverUrl": "https://translate.onit.systems",
   "label": "Console Mac",
   "agentPsk": "...",
-  "channel": 1
+
+  "channel": 1            // just channel 1
+  // "channel": "1-8"     // sum channels 1–8 — use this when a mixer
+                          //   feeds the AudioBox on any of several channels
+  // "channel": "1,3,5"   // sum specific channels
+  // "channel": [1,3,5]   // array form
 }
 ```
 
-The agent appends `remix 1` (1-based) to its sox command when this is set, which makes the device act effectively single-channel. The startup log line shows `[direct coreaudio, remix ch 1]` to confirm it's active.
+The startup log line shows the active spec, e.g. `[direct coreaudio, remix 1-8]`.
 
 To find which channel your mic is on, run sox manually and check per-channel RMS:
 
@@ -201,7 +206,9 @@ To find which channel your mic is on, run sox manually and check per-channel RMS
 sox -t coreaudio "AudioBox 1818 VSL" -n stats trim 0 5
 ```
 
-The channel with a real RMS (not `-inf dB`) is the one to put in `channel`.
+The channel(s) with a real RMS (not `-inf dB`) are the ones to include in `channel`. If you can't predict which channel will be active (e.g. a mixer routes audio dynamically), use a range that covers all the inputs the mixer might use — sox will sum them and unused channels stay at zero.
+
+> **Note:** if *every* channel reports `-inf dB` / `Pk count` equal to all-zero samples, the issue is upstream of channel selection — sox is being handed empty buffers. Check macOS Microphone permission for Terminal *and* sox in System Settings → Privacy & Security → Microphone, and confirm the device driver is loaded (PreSonus interfaces require Universal Control; MOTU/RME ship their own drivers).
 
 ## Troubleshooting
 

@@ -96,15 +96,38 @@ if (!serverUrl) {
 }
 
 // Optional input-channel selector for multi-channel coreaudio devices.
-// PreSonus interfaces (e.g. AudioBox 1818 VSL) expose 18 channels and
-// sox's default downmix averages them — so a mic on ch 1 gets divided
-// by ~18 and reaches the server as silence. Setting `channel: 1` (or
-// any 1-based index) appends `remix N` to the sox command so only that
-// channel feeds the mono output. Unset / 0 = preserve default downmix
-// (matters for stereo devices that should keep summing L+R).
-const inputChannel = Number.isInteger(config.channel) && config.channel > 0
-  ? config.channel
-  : 0;
+// Sox's default downmix AVERAGES all channels (divides each by N), so a
+// single mic on ch 1 of an 18-channel device arrives ~24 dB down and
+// reaches the server as silence. The `channel` config setting selects
+// which input channels feed the mono output via sox's `remix` effect:
+//
+//   number 1          → just channel 1
+//   string "1-8"      → sum channels 1 through 8 (sox range shorthand)
+//   string "1,3,5"    → sum channels 1, 3, and 5
+//   array [1,3,5]     → same as "1,3,5"
+//
+// `remix` SUMS (does not average), so silent channels contribute 0 and
+// any active channel passes through at full amplitude. Use a range when
+// audio can arrive on any of several inputs (e.g. a mixer feeding the
+// AudioBox on different channels per song).
+function normalizeChannelSpec(value) {
+  if (value == null || value === '' || value === 0) return '';
+  if (typeof value === 'number' && Number.isInteger(value) && value > 0) {
+    return String(value);
+  }
+  if (Array.isArray(value)) {
+    const ints = value.filter((n) => Number.isInteger(n) && n > 0);
+    return ints.length ? ints.join(',') : '';
+  }
+  if (typeof value === 'string') {
+    const cleaned = value.replace(/\s+/g, '');
+    if (/^\d+(?:-\d+)?(?:,\d+(?:-\d+)?)*$/.test(cleaned)) return cleaned;
+    console.warn(`[Agent] Ignoring invalid channel spec "${value}" — expected number, "1-8", "1,3,5", or array.`);
+  }
+  return '';
+}
+
+const channelSpec = normalizeChannelSpec(config.channel);
 
 // Pre-shared key — required by servers that enforce agent auth. Falls back
 // to the AGENT_PSK env var so the launchd plist or shell can override the
@@ -331,12 +354,12 @@ function startSoxCoreaudio(deviceName) {
     '-t', 'raw',
     '-', // stdout
   ];
-  // `remix N` is a sox EFFECT, so it goes after the output spec. Picks a
-  // single input channel for the mono downmix instead of averaging all
-  // device channels (which silences mic signal on multi-channel
-  // interfaces like the AudioBox 1818 VSL).
-  if (inputChannel > 0) {
-    args.push('remix', String(inputChannel));
+  // `remix` is a sox EFFECT, so it goes after the output spec. With a
+  // single channel it isolates that input; with a range/list (e.g.
+  // "1-8") it SUMS those channels into the mono output — neither path
+  // applies the 1/N attenuation that the default downmix would.
+  if (channelSpec) {
+    args.push('remix', channelSpec);
   }
   const child = spawn(SOX_BIN, args, { stdio: ['ignore', 'pipe', 'pipe'] });
   return {
@@ -385,7 +408,7 @@ function startStreaming() {
         const synthMsg = stderrBuf || `sox exited (code=${code} signal=${signal})`;
         emitStreamError({ message: synthMsg });
       });
-      console.log(`[Agent] Mic capture running (16 kHz, 16-bit mono PCM) on ${deviceName} [direct coreaudio${inputChannel > 0 ? `, remix ch ${inputChannel}` : ''}]`);
+      console.log(`[Agent] Mic capture running (16 kHz, 16-bit mono PCM) on ${deviceName} [direct coreaudio${channelSpec ? `, remix ${channelSpec}` : ''}]`);
     } else {
       const recordOpts = {
         sampleRate: 16000,
