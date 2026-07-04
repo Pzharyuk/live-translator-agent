@@ -129,6 +129,7 @@ launchctl list | grep live-translator      # raw launchctl
 | `device` | _(system default)_ | Audio input device name (see `sox -d --list-devtypes`) |
 | `agentPsk` | `""` | Pre-shared key the server requires from agents. Get this from your server admin (`auth.agent_psk` in `application.yaml` / `AGENT_PSK` env). The `AGENT_PSK` env var overrides this field if both are set. |
 | `channel` | _(unset)_ | Which input channels of a multi-channel coreaudio device should feed the mono output. Accepts a number (`1`), a sox range string (`"1-8"`), a comma list (`"1,3,5"`), or an array (`[1,3,5]`). Sox `remix` *sums* the selected channels (no 1/N attenuation), so silent channels contribute zero and any active channel passes through at full amplitude. Required for multi-channel interfaces (PreSonus AudioBox, MOTU, RME) where the default downmix would silence a mic. Leave unset for laptops / USB mics. |
+| `soxBufferBytes` | `131072` | Size of sox's processing buffer (`--buffer`, in bytes) for the direct coreaudio capture path. Larger buffers absorb brief stdout stalls so the coreaudio input ring doesn't overrun and drop audio (`coreaudio: unhandled buffer overrun. Data discarded`, which the server then flags as a stalled feed). Raise it (e.g. `262144`) if overruns persist on a busy interface; set `0` to use sox's default (8192). Values below `16384` are clamped up. |
 
 ## Pre-shared key (agent auth)
 

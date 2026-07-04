@@ -129,6 +129,26 @@ function normalizeChannelSpec(value) {
 
 const channelSpec = normalizeChannelSpec(config.channel);
 
+// sox coreaudio input buffer size (bytes). sox's coreaudio driver fills a
+// ring from the audio callback while sox's main loop drains it toward
+// stdout. When that loop stalls briefly (stdout backpressure from the
+// socket, a GC pause, a large Buffer.concat), the ring overruns and sox
+// logs "coreaudio: unhandled buffer overrun. Data discarded" — audio is
+// silently dropped and the server's watchdog then flags the feed stalled.
+// sox's default processing buffer is only 8192 bytes (~256ms at 16k mono);
+// a larger `--buffer` gives the loop much more slack per iteration. Tunable
+// via config so it can be adjusted on-device without a rebuild; 0 keeps
+// sox's default.
+function normalizeBufferBytes(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 0) return 131072;
+  if (n === 0) return 0; // explicit opt-out — use sox default
+  // Clamp to a sane floor so a tiny value can't make overruns worse.
+  return Math.max(16384, Math.floor(n));
+}
+
+const soxBufferBytes = normalizeBufferBytes(config.soxBufferBytes ?? 131072);
+
 // Pre-shared key — required by servers that enforce agent auth. Falls back
 // to the AGENT_PSK env var so the launchd plist or shell can override the
 // on-disk value without rewriting config.json.
@@ -345,7 +365,14 @@ function diagnoseStreamError(err, msSinceStart, bytesReceived, stderrBuf) {
  * recorder so the caller's stream() interface works unchanged.
  */
 function startSoxCoreaudio(deviceName) {
-  const args = [
+  const args = [];
+  // `--buffer` is a GLOBAL option — it must precede the input spec. Enlarges
+  // sox's processing buffer to absorb brief stdout stalls without the
+  // coreaudio ring overrunning (see soxBufferBytes above).
+  if (soxBufferBytes > 0) {
+    args.push('--buffer', String(soxBufferBytes));
+  }
+  args.push(
     '-t', 'coreaudio', deviceName,
     '-r', '16000',
     '-c', '1',
@@ -353,7 +380,7 @@ function startSoxCoreaudio(deviceName) {
     '-e', 'signed-integer',
     '-t', 'raw',
     '-', // stdout
-  ];
+  );
   // `remix` is a sox EFFECT, so it goes after the output spec. With a
   // single channel it isolates that input; with a range/list (e.g.
   // "1-8") it SUMS those channels into the mono output — neither path
@@ -408,7 +435,7 @@ function startStreaming() {
         const synthMsg = stderrBuf || `sox exited (code=${code} signal=${signal})`;
         emitStreamError({ message: synthMsg });
       });
-      console.log(`[Agent] Mic capture running (16 kHz, 16-bit mono PCM) on ${deviceName} [direct coreaudio${channelSpec ? `, remix ${channelSpec}` : ''}]`);
+      console.log(`[Agent] Mic capture running (16 kHz, 16-bit mono PCM) on ${deviceName} [direct coreaudio${channelSpec ? `, remix ${channelSpec}` : ''}${soxBufferBytes > 0 ? `, buffer ${soxBufferBytes}B` : ''}]`);
     } else {
       const recordOpts = {
         sampleRate: 16000,
