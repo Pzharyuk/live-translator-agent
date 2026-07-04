@@ -9,6 +9,7 @@ const os = require('os');
 const crypto = require('crypto');
 const { execFileSync, spawnSync, spawn } = require('child_process');
 const { parseAudioDevices } = require('./scripts/parse-audio-devices');
+const { createCaptureGuard } = require('./capture-guard');
 
 // ---------------------------------------------------------------------------
 // CLI subcommands — these short-circuit the daemon and exit
@@ -206,6 +207,12 @@ let recording = null;
 let isStreaming = false;
 let audioBuffer = Buffer.alloc(0);
 
+// Guarantees a single audio-capture (sox) process at a time. Tracks spawned
+// captures and force-kills leftovers so a restart/source-toggle can't leave
+// two sox feeding the socket (which doubled audio into Scribe → duplicate
+// transcripts). See capture-guard.js.
+const captureGuard = createCaptureGuard();
+
 // ---------------------------------------------------------------------------
 // Socket.io connection
 // ---------------------------------------------------------------------------
@@ -389,17 +396,28 @@ function startSoxCoreaudio(deviceName) {
     args.push('remix', channelSpec);
   }
   const child = spawn(SOX_BIN, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+  // Track this capture so leftovers can be force-killed before the next start.
+  captureGuard.register(child);
   return {
     process: child,
     stream: () => child.stdout,
     stderr: child.stderr,
-    stop: () => { try { child.kill('SIGTERM'); } catch { /* already gone */ } },
+    // Reliable stop: SIGTERM, then SIGKILL if sox lingers (a large --buffer can
+    // make it slow to exit). Fire-and-forget SIGTERM was how the old sox
+    // outlived a stopStreaming() and became a duplicate on the next start.
+    stop: () => captureGuard.forceKill(child),
   };
 }
 
 function startStreaming() {
   if (isStreaming) return;
   isStreaming = true;
+  // Belt-and-suspenders: kill any capture that leaked from a previous cycle
+  // BEFORE spawning the new one, so two sox can never coexist.
+  captureGuard.sweep(null);
+  // Tag this capture; a stale sox's delayed exit handler checks its own gen
+  // and bails instead of corrupting this capture's state.
+  const myGen = captureGuard.nextGen();
   audioBuffer = Buffer.alloc(0);
   let bytesReceived = 0;
   const startedAt = Date.now();
@@ -429,6 +447,10 @@ function startStreaming() {
         })
         .on('error', (err) => emitStreamError(err));
       recording.process.on('exit', (code, signal) => {
+        // A newer capture already owns the state — this is a stale/leftover sox
+        // exiting (e.g. one we just swept). Ignore so it can't tear down the
+        // live capture.
+        if (!captureGuard.isCurrent(myGen)) return;
         if (!isStreaming) return; // intentional stop
         // sox exiting on its own = error path
         const msSinceStart = Date.now() - startedAt;
@@ -482,6 +504,9 @@ function stopStreaming() {
   if (!isStreaming) return;
   isStreaming = false;
   audioBuffer = Buffer.alloc(0);
+  // Invalidate any in-flight capture: a lingering sox's exit handler will now
+  // see a newer generation and bail.
+  captureGuard.nextGen();
 
   if (recording) {
     try {
@@ -491,6 +516,9 @@ function stopStreaming() {
     }
     recording = null;
   }
+  // Final guard: force-kill anything still tracked (covers the non-direct-sox
+  // recorder path and any straggler).
+  captureGuard.sweep(null);
 
   console.log('[Agent] Mic capture stopped');
 }
