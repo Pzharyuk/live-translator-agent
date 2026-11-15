@@ -10,6 +10,14 @@ const crypto = require('crypto');
 const { execFileSync, spawnSync, spawn } = require('child_process');
 const { parseAudioDevices } = require('./scripts/parse-audio-devices');
 const { createCaptureGuard } = require('./capture-guard');
+const {
+  resolveSoxBufferConfig,
+  buildCoreaudioSoxArgs,
+  probeSoxInputBuffer,
+  chunkStatsRequested,
+  createChunkGapTracker,
+  formatChunkGapStats,
+} = require('./sox-args');
 
 // ---------------------------------------------------------------------------
 // CLI subcommands — these short-circuit the daemon and exit
@@ -130,25 +138,31 @@ function normalizeChannelSpec(value) {
 
 const channelSpec = normalizeChannelSpec(config.channel);
 
-// sox coreaudio input buffer size (bytes). sox's coreaudio driver fills a
-// ring from the audio callback while sox's main loop drains it toward
-// stdout. When that loop stalls briefly (stdout backpressure from the
-// socket, a GC pause, a large Buffer.concat), the ring overruns and sox
-// logs "coreaudio: unhandled buffer overrun. Data discarded" — audio is
-// silently dropped and the server's watchdog then flags the feed stalled.
-// sox's default processing buffer is only 8192 bytes (~256ms at 16k mono);
-// a larger `--buffer` gives the loop much more slack per iteration. Tunable
-// via config so it can be adjusted on-device without a rebuild; 0 keeps
-// sox's default.
-function normalizeBufferBytes(value) {
-  const n = Number(value);
-  if (!Number.isFinite(n) || n < 0) return 131072;
-  if (n === 0) return 0; // explicit opt-out — use sox default
-  // Clamp to a sane floor so a tiny value can't make overruns worse.
-  return Math.max(16384, Math.floor(n));
+// Split sox's single `--buffer` (v1.4.2 used 131072, which also sized stdout
+// and made 16 kHz mono arrive in ~4 s bursts) into a large `--input-buffer`
+// and a small `--buffer`. Existing `soxBufferBytes` values are still honored
+// as `--buffer`. See sox-args.js for the SoX 14.4.2 semantics, including the
+// fact that the coreaudio ring follows `--buffer`, not `--input-buffer`.
+const { bufferBytes: soxBufferBytes, inputBufferBytes: soxInputBufferBytes } =
+  resolveSoxBufferConfig(config);
+// Probe the binary this daemon actually spawns. Non-macOS never takes the
+// direct coreaudio path, and SOX_BIN is a Homebrew path that does not exist
+// there — don't warn on every Linux start.
+const inputBufferSupported = process.platform === 'darwin'
+  ? probeSoxInputBuffer(SOX_BIN).supported
+  : false;
+if (process.platform === 'darwin' && soxInputBufferBytes > 0 && !inputBufferSupported) {
+  const { warnings } = buildCoreaudioSoxArgs({
+    deviceName: '',
+    bufferBytes: soxBufferBytes,
+    inputBufferBytes: soxInputBufferBytes,
+    inputBufferSupported: false,
+  });
+  for (const warning of warnings) console.warn(`[Agent] ${warning}`);
 }
-
-const soxBufferBytes = normalizeBufferBytes(config.soxBufferBytes ?? 131072);
+// Off unless config soxChunkStats or env SOX_CHUNK_STATS is set. Logs p50/p95/max
+// inter-arrival of sox stdout reads once a minute.
+const soxChunkStats = chunkStatsRequested(config, process.env);
 
 // Pre-shared key — required by servers that enforce agent auth. Falls back
 // to the AGENT_PSK env var so the launchd plist or shell can override the
@@ -206,6 +220,21 @@ const CHUNK_SIZE = 8192;
 let recording = null;
 let isStreaming = false;
 let audioBuffer = Buffer.alloc(0);
+let chunkGapTracker = null;
+
+function stopChunkGapTracker() {
+  if (!chunkGapTracker) return;
+  chunkGapTracker.stop();
+  chunkGapTracker = null;
+}
+
+function soxBufferLogSuffix() {
+  const parts = [];
+  if (soxInputBufferBytes > 0 && inputBufferSupported) parts.push(`input-buffer ${soxInputBufferBytes}B`);
+  else if (soxInputBufferBytes > 0) parts.push('input-buffer unsupported');
+  if (soxBufferBytes > 0) parts.push(`buffer ${soxBufferBytes}B`);
+  return parts.length ? `, ${parts.join(', ')}` : '';
+}
 
 // Guarantees a single audio-capture (sox) process at a time. Tracks spawned
 // captures and force-kills leftovers so a restart/source-toggle can't leave
@@ -372,29 +401,15 @@ function diagnoseStreamError(err, msSinceStart, bytesReceived, stderrBuf) {
  * recorder so the caller's stream() interface works unchanged.
  */
 function startSoxCoreaudio(deviceName) {
-  const args = [];
-  // `--buffer` is a GLOBAL option — it must precede the input spec. Enlarges
-  // sox's processing buffer to absorb brief stdout stalls without the
-  // coreaudio ring overrunning (see soxBufferBytes above).
-  if (soxBufferBytes > 0) {
-    args.push('--buffer', String(soxBufferBytes));
-  }
-  args.push(
-    '-t', 'coreaudio', deviceName,
-    '-r', '16000',
-    '-c', '1',
-    '-b', '16',
-    '-e', 'signed-integer',
-    '-t', 'raw',
-    '-', // stdout
-  );
-  // `remix` is a sox EFFECT, so it goes after the output spec. With a
-  // single channel it isolates that input; with a range/list (e.g.
-  // "1-8") it SUMS those channels into the mono output — neither path
-  // applies the 1/N attenuation that the default downmix would.
-  if (channelSpec) {
-    args.push('remix', channelSpec);
-  }
+  // Global options precede the input spec. `--input-buffer` is omitted when
+  // this sox doesn't advertise it (see the startup warning).
+  const { args } = buildCoreaudioSoxArgs({
+    deviceName,
+    channelSpec,
+    bufferBytes: soxBufferBytes,
+    inputBufferBytes: soxInputBufferBytes,
+    inputBufferSupported,
+  });
   const child = spawn(SOX_BIN, args, { stdio: ['ignore', 'pipe', 'pipe'] });
   // Track this capture so leftovers can be force-killed before the next start.
   captureGuard.register(child);
@@ -412,6 +427,11 @@ function startSoxCoreaudio(deviceName) {
 function startStreaming() {
   if (isStreaming) return;
   isStreaming = true;
+  stopChunkGapTracker();
+  chunkGapTracker = createChunkGapTracker({
+    enabled: soxChunkStats,
+    onReport: (stats) => console.log(formatChunkGapStats(stats)),
+  });
   // Belt-and-suspenders: kill any capture that leaked from a previous cycle
   // BEFORE spawning the new one, so two sox can never coexist.
   captureGuard.sweep(null);
@@ -436,15 +456,7 @@ function startStreaming() {
       recording = startSoxCoreaudio(deviceName);
       recording.stderr.on('data', (chunk) => { stderrBuf += chunk.toString(); });
       recording.stream()
-        .on('data', (chunk) => {
-          bytesReceived += chunk.length;
-          audioBuffer = Buffer.concat([audioBuffer, chunk]);
-          while (audioBuffer.length >= CHUNK_SIZE) {
-            const slice = audioBuffer.subarray(0, CHUNK_SIZE);
-            audioBuffer = audioBuffer.subarray(CHUNK_SIZE);
-            socket.emit('audio_chunk', { audio: slice.toString('base64') });
-          }
-        })
+        .on('data', onAudioData)
         .on('error', (err) => emitStreamError(err));
       recording.process.on('exit', (code, signal) => {
         // A newer capture already owns the state — this is a stale/leftover sox
@@ -457,7 +469,7 @@ function startStreaming() {
         const synthMsg = stderrBuf || `sox exited (code=${code} signal=${signal})`;
         emitStreamError({ message: synthMsg });
       });
-      console.log(`[Agent] Mic capture running (16 kHz, 16-bit mono PCM) on ${deviceName} [direct coreaudio${channelSpec ? `, remix ${channelSpec}` : ''}${soxBufferBytes > 0 ? `, buffer ${soxBufferBytes}B` : ''}]`);
+      console.log(`[Agent] Mic capture running (16 kHz, 16-bit mono PCM) on ${deviceName} [direct coreaudio${channelSpec ? `, remix ${channelSpec}` : ''}${soxBufferLogSuffix()}]`);
     } else {
       const recordOpts = {
         sampleRate: 16000,
@@ -469,15 +481,7 @@ function startStreaming() {
       recording = recorder.record(recordOpts);
       recording
         .stream()
-        .on('data', (chunk) => {
-          bytesReceived += chunk.length;
-          audioBuffer = Buffer.concat([audioBuffer, chunk]);
-          while (audioBuffer.length >= CHUNK_SIZE) {
-            const slice = audioBuffer.subarray(0, CHUNK_SIZE);
-            audioBuffer = audioBuffer.subarray(CHUNK_SIZE);
-            socket.emit('audio_chunk', { audio: slice.toString('base64') });
-          }
-        })
+        .on('data', onAudioData)
         .on('error', (err) => emitStreamError(err));
       console.log(`[Agent] Mic capture running (16 kHz, 16-bit mono PCM) on default device`);
     }
@@ -486,8 +490,20 @@ function startStreaming() {
     return;
   }
 
+  function onAudioData(chunk) {
+    if (chunkGapTracker) chunkGapTracker.note(chunk.length);
+    bytesReceived += chunk.length;
+    audioBuffer = Buffer.concat([audioBuffer, chunk]);
+    while (audioBuffer.length >= CHUNK_SIZE) {
+      const slice = audioBuffer.subarray(0, CHUNK_SIZE);
+      audioBuffer = audioBuffer.subarray(CHUNK_SIZE);
+      socket.emit('audio_chunk', { audio: slice.toString('base64') });
+    }
+  }
+
   function emitStreamError(err) {
     if (!isStreaming) return; // already torn down
+    stopChunkGapTracker();
     const msSinceStart = Date.now() - startedAt;
     const message = diagnoseStreamError(err, msSinceStart, bytesReceived, stderrBuf);
     console.error(`[Agent] Audio stream error: ${message} (raw="${err?.message ?? ''}", stderr="${stderrBuf.slice(0, 200).trim()}", bytes=${bytesReceived}, ms=${msSinceStart})`);
@@ -504,6 +520,7 @@ function stopStreaming() {
   if (!isStreaming) return;
   isStreaming = false;
   audioBuffer = Buffer.alloc(0);
+  stopChunkGapTracker();
   // Invalidate any in-flight capture: a lingering sox's exit handler will now
   // see a newer generation and bail.
   captureGuard.nextGen();
