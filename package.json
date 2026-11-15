@@ -8,7 +8,7 @@
   },
   "scripts": {
     "start": "node daemon.js",
-    "test": "node test/capture-guard.test.js"
+    "test": "node test/capture-guard.test.js && node test/sox-args.test.js"
   },
   "dependencies": {
     "node-record-lpcm16": "^1.0.1",
